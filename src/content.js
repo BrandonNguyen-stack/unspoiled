@@ -17,6 +17,12 @@ function getSelectors() {
       text: "#video-title, #content-text",
     };
   }
+  if (host.includes("tiktok.com")) {
+    return {
+      post: 'article[data-e2e="recommend-list-item-container"]',
+      text: '[data-e2e="video-desc"]',
+    };
+  }
   return null;
 }
 
@@ -63,6 +69,20 @@ const UI_CHROME = new Set([
 ]);
 
 function extractPostText(el, selectors) {
+  if (location.hostname.includes("tiktok.com")) {
+    const descEl = el.querySelector('[data-e2e="video-desc"]');
+    const caption = descEl?.textContent?.trim() || "";
+    console.log("[Unspoiled] TikTok caption extracted:", caption.slice(0, 80));
+    if (!caption) {
+      setTimeout(() => {
+        if (!el.dataset.unspoiled && !el.dataset.unspoiledPreblur) {
+          processedIds.delete(el);
+          enqueue(el, currentSelectors);
+        }
+      }, 800);
+    }
+    return { text: caption || "video", source: "tiktok-caption" };
+  }
   if (el.tagName?.toLowerCase() === "ytd-reel-video-renderer") {
     const titleEl = el.querySelector("ytd-reel-player-overlay-renderer #title") ||
       el.querySelector("#title") || el.querySelector("h2");
@@ -361,6 +381,32 @@ function observeYouTubeShorts(selectors) {
   navigation.addEventListener("navigate", () => setTimeout(scanCurrentShort, 300));
 }
 
+let tiktokIntersectionObserver = null;
+
+function getTiktokIntersectionObserver(selectors) {
+  if (tiktokIntersectionObserver) return tiktokIntersectionObserver;
+  tiktokIntersectionObserver = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        tiktokIntersectionObserver.unobserve(entry.target);
+        pollForTiktokCaption(entry.target, selectors);
+      });
+    },
+    { root: null, rootMargin: "0px", threshold: 0.5 }
+  );
+  return tiktokIntersectionObserver;
+}
+
+function pollForTiktokCaption(el, selectors, attempt = 0) {
+  const desc = el.querySelector('[data-e2e="video-desc"]')?.textContent?.trim();
+  if (desc || attempt >= 8) {
+    enqueue(el, selectors);
+    return;
+  }
+  setTimeout(() => pollForTiktokCaption(el, selectors, attempt + 1), 250);
+}
+
 function enqueue(el, selectors) {
   // YouTube wraps cards in grid containers (ytd-rich-item-renderer > yt-lockup-view-model);
   // both match the post selector and would each get an overlay. Skip the wrapper when it
@@ -372,6 +418,23 @@ function enqueue(el, selectors) {
     el.querySelector(selectors.post)
   ) {
     return;
+  }
+
+  // Sponsored TikTok posts are skipped entirely — Unspoiled is a spoiler filter, not an ad blocker.
+  if (location.hostname.includes("tiktok.com") && el.querySelector('[data-e2e="ad-tag"]')) {
+    return;
+  }
+
+  // TikTok only hydrates a card's caption text once it's near the viewport — cards further
+  // away in the feed have no video-desc element yet. Wait for intersection before extracting
+  // instead of processing on DOM-insertion, which is too early.
+  if (location.hostname.includes("tiktok.com") && !el.dataset.unspoiledTiktokQueued) {
+    const desc = el.querySelector('[data-e2e="video-desc"]')?.textContent?.trim();
+    if (!desc) {
+      el.dataset.unspoiledTiktokQueued = "1";
+      getTiktokIntersectionObserver(selectors).observe(el);
+      return;
+    }
   }
 
   const id = getStatusId(el);
@@ -455,6 +518,9 @@ function addFlagButton(el, key, postText) {
 
   const btn = document.createElement("button");
   btn.className = "unspoiled-flag-btn";
+  if (location.hostname.includes("tiktok.com")) {
+    btn.classList.add("unspoiled-flag-btn-tiktok");
+  }
   btn.title = "Report as missed spoiler";
   btn.innerHTML = `<span class="unspoiled-flag-icon">🚩</span><span class="unspoiled-flag-label">Spoiler?</span>`;
   el.appendChild(btn);
@@ -527,7 +593,9 @@ function blurYouTubePost(el, postText, showId = null) {
 function blurPost(el, postText, showId = null) {
   if (el.dataset.unspoiled) return;
 
-  if (location.hostname.includes("youtube.com")) {
+  // TikTok cards are video surfaces like YouTube's — use the opaque in-element overlay
+  // instead of the X-style blur filter with a sibling overlay.
+  if (location.hostname.includes("youtube.com") || location.hostname.includes("tiktok.com")) {
     blurYouTubePost(el, postText, showId);
     return;
   }
@@ -625,6 +693,9 @@ function injectStyles() {
       padding: 0;
       cursor: pointer;
       z-index: 100;
+    }
+    .unspoiled-flag-btn-tiktok {
+      top: 140px !important;
     }
     .unspoiled-flag-icon {
       font-size: 16px;
