@@ -2,6 +2,15 @@ console.log("[Unspoiled] content script loaded");
 
 const API_URL = "https://unspoiled-api-sable.vercel.app/api/classify";
 
+// TikTok search results use a grid layout with different selectors than the For You feed
+function isTiktokSearch() {
+  return location.hostname.includes("tiktok.com") && location.pathname.startsWith("/search");
+}
+
+function isTiktokProfile() {
+  return location.hostname.includes("tiktok.com") && /^\/@[^/]+\/?$/.test(location.pathname);
+}
+
 // Selectors per platform
 function getSelectors() {
   const host = location.hostname;
@@ -18,6 +27,18 @@ function getSelectors() {
     };
   }
   if (host.includes("tiktok.com")) {
+    if (isTiktokSearch()) {
+      return {
+        post: 'div[class*="DivItemContainerV2"]',
+        text: '[data-e2e="search-card-desc"]',
+      };
+    }
+    if (isTiktokProfile()) {
+      return {
+        post: 'div[class*="DivItemContainerV2"]',
+        text: 'img[alt]',
+      };
+    }
     return {
       post: 'article[data-e2e="recommend-list-item-container"]',
       text: '[data-e2e="video-desc"]',
@@ -69,8 +90,24 @@ const UI_CHROME = new Set([
 ]);
 
 function extractPostText(el, selectors) {
+  if (location.hostname.includes("tiktok.com") && isTiktokProfile()) {
+    const imgEl = el.querySelector('img[alt]');
+    const caption = imgEl?.alt?.trim() || "";
+    console.log("[Unspoiled] TikTok profile grid caption extracted:", caption.slice(0, 80));
+    if (!caption) {
+      setTimeout(() => {
+        if (!el.dataset.unspoiled && !el.dataset.unspoiledPreblur) {
+          processedIds.delete(el);
+          enqueue(el, currentSelectors);
+        }
+      }, 800);
+    }
+    return { text: caption || "video", source: "tiktok-profile-alt" };
+  }
   if (location.hostname.includes("tiktok.com")) {
-    const descEl = el.querySelector('[data-e2e="video-desc"]');
+    const descEl = el.querySelector(
+      isTiktokSearch() ? '[data-e2e="search-card-desc"]' : '[data-e2e="video-desc"]'
+    );
     const caption = descEl?.textContent?.trim() || "";
     console.log("[Unspoiled] TikTok caption extracted:", caption.slice(0, 80));
     if (!caption) {
@@ -428,7 +465,7 @@ function enqueue(el, selectors) {
   // TikTok only hydrates a card's caption text once it's near the viewport — cards further
   // away in the feed have no video-desc element yet. Wait for intersection before extracting
   // instead of processing on DOM-insertion, which is too early.
-  if (location.hostname.includes("tiktok.com") && !el.dataset.unspoiledTiktokQueued) {
+  if (location.hostname.includes("tiktok.com") && !isTiktokSearch() && !isTiktokProfile() && !el.dataset.unspoiledTiktokQueued) {
     const desc = el.querySelector('[data-e2e="video-desc"]')?.textContent?.trim();
     if (!desc) {
       el.dataset.unspoiledTiktokQueued = "1";
@@ -519,7 +556,11 @@ function addFlagButton(el, key, postText) {
   const btn = document.createElement("button");
   btn.className = "unspoiled-flag-btn";
   if (location.hostname.includes("tiktok.com")) {
-    btn.classList.add("unspoiled-flag-btn-tiktok");
+    if (isTiktokSearch() || isTiktokProfile()) {
+      btn.classList.add("unspoiled-flag-btn-tiktok-search");
+    } else {
+      btn.classList.add("unspoiled-flag-btn-tiktok");
+    }
   }
   btn.title = "Report as missed spoiler";
   btn.innerHTML = `<span class="unspoiled-flag-icon">🚩</span><span class="unspoiled-flag-label">Spoiler?</span>`;
@@ -696,6 +737,17 @@ function injectStyles() {
     }
     .unspoiled-flag-btn-tiktok {
       top: 140px !important;
+    }
+    .unspoiled-flag-btn-tiktok-search {
+      top: 6px !important;
+      right: 6px !important;
+    }
+    .unspoiled-flag-btn-tiktok-search .unspoiled-flag-icon {
+      font-size: 12px;
+    }
+    .unspoiled-flag-btn-tiktok-search .unspoiled-flag-label {
+      font-size: 9px;
+      padding: 1px 6px;
     }
     .unspoiled-flag-icon {
       font-size: 16px;
