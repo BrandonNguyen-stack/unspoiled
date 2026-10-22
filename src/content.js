@@ -121,7 +121,8 @@ function extractPostText(el, selectors) {
     return { text: caption || "video", source: "tiktok-caption" };
   }
   if (el.tagName?.toLowerCase() === "ytd-reel-video-renderer") {
-    const titleEl = el.querySelector("ytd-reel-player-overlay-renderer #title") ||
+    const titleEl = el.querySelector("yt-shorts-video-title-view-model h1") ||
+      el.querySelector("ytd-reel-player-overlay-renderer #title") ||
       el.querySelector("#title") || el.querySelector("h2");
     const title = titleEl?.textContent?.trim() || "";
     console.log("[Unspoiled] Shorts player title extracted:", title.slice(0, 80));
@@ -286,6 +287,12 @@ function scanAllVisiblePosts() {
     injectStyles();
     stylesInjected = true;
     observePage(currentSelectors);
+    // Page loaded with an empty blocklist, so init() returned before attaching the
+    // YouTube-specific watchers — attach them now that the first show was added.
+    if (location.hostname.includes("youtube.com")) {
+      observeYouTubeSidebar(currentSelectors);
+      observeYouTubeShorts(currentSelectors);
+    }
   }
   const count = document.querySelectorAll(currentSelectors.post).length;
   console.log(`[Unspoiled] rescanning ${count} visible posts after blocklist change`);
@@ -389,33 +396,289 @@ function observeYouTubeSidebar(selectors) {
   watcher.observe(document.body, { childList: true, subtree: true });
 }
 
-function observeYouTubeShorts(selectors) {
-  let lastShortsPath = null;
+// YouTube Shorts fullscreen player.
+// YouTube reuses ONE ytd-reel-video-renderer for every Short. The URL is NOT a reliable signal
+// for which Short is on screen: the player sometimes swaps to the next video ~150ms before the
+// URL changes, and the on-screen caption can still show the previous Short's title. The player's
+// hidden title link (#shorts-player a.ytp-title-link) is reliable: its href holds the video ID
+// that is actually loaded, and its text is that video's title — both update together.
+//
+// So Shorts are tracked by that video ID. The player is covered the moment it starts swapping
+// videos (before the new video's first frame), the title is only accepted when it belongs to the
+// Short being checked, and the cover is changed in place (checking → spoiler, or removed) so it
+// never flickers.
+let shortsController = null;
 
-  const scanCurrentShort = () => {
-    if (!location.pathname.startsWith("/shorts")) return;
-    const currentPath = location.pathname;
-    const el = document.querySelector("ytd-reel-video-renderer");
-    if (!el) return;
-
-    if (currentPath !== lastShortsPath) {
-      lastShortsPath = currentPath;
-      processedIds.delete(el);
-      spoilerIds.delete(el);
-      spoilerShowIds.delete(el);
-      processedTexts.delete(el);
-      delete el.dataset.unspoiled;
-      delete el.dataset.unspoiledPreblur;
-      el.style.visibility = "";
-      el.querySelector(".unspoiled-overlay")?.remove();
-      el.querySelector(".unspoiled-flag-btn")?.remove();
+async function classifyShort(text) {
+  try {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ posts: [{ id: "short", text }], blocklist }),
+    });
+    if (!res.ok) {
+      console.error("[Unspoiled] API error:", res.status);
+      return false;
     }
+    const data = await res.json();
+    console.log("[Unspoiled] classify response:", data);
+    return data.results?.find((r) => String(r.id) === "short")?.spoiler === true;
+  } catch (err) {
+    console.error("[Unspoiled] classify error:", err);
+    return false;
+  }
+}
 
-    enqueue(el, selectors);
+function observeYouTubeShorts(selectors) {
+  let evaluatedId = null;    // video ID whose cover/verdict is currently applied
+  let evaluatedTitle = "";
+  let evaluatedShowId = null;
+  let verdict = null;        // "checking" | "clear" | "spoiler" | "revealed"
+  let keywordSig = null;     // keywords used for the current verdict; a change forces a re-check
+  let runId = 0;             // bumped on every new check so late async results are ignored
+  let holdPlayback = false;  // while true, any attempt to play the Short is paused
+  let pausedByUs = false;
+  let mutedByUs = false;
+  let swapTimer = null;
+  let swapDeadline = 0;
+  let observedRenderer = null;
+
+  const onShortsPage = () => location.pathname.startsWith("/shorts/");
+  const renderer = () => document.querySelector("ytd-reel-video-renderer");
+  const video = () => renderer()?.querySelector("video");
+  const playerLink = () => renderer()?.querySelector("#shorts-player a.ytp-title-link");
+  const idFromHref = (href) => (href || "").match(/\/shorts\/([\w-]+)/)?.[1] || null;
+  // The video actually loaded in the player (falls back to the URL if the link isn't there)
+  const playerId = () => idFromHref(playerLink()?.getAttribute("href")) || idFromHref(location.pathname);
+  const captionText = () =>
+    renderer()?.querySelector("yt-shorts-video-title-view-model h1")?.textContent?.trim() || "";
+
+  const titleFor = (id, prevCaption) => {
+    const link = playerLink();
+    if (link && idFromHref(link.getAttribute("href")) === id) {
+      const t = link.textContent.trim();
+      if (t) return t;
+    }
+    // Backup: the on-screen caption, but only once it no longer shows the previous Short's title
+    const cap = captionText();
+    if (cap && cap !== prevCaption) return cap;
+    return "";
   };
 
-  if (location.pathname.startsWith("/shorts")) setTimeout(scanCurrentShort, 300);
-  navigation.addEventListener("navigate", () => setTimeout(scanCurrentShort, 300));
+  // "play" doesn't bubble, but a capturing listener on document still sees it
+  document.addEventListener("play", (e) => {
+    if (holdPlayback && e.target.closest?.("ytd-reel-video-renderer")) e.target.pause();
+  }, true);
+
+  const pausePlayback = () => {
+    const v = video();
+    if (mutedByUs && v) v.muted = false;
+    mutedByUs = false;
+    holdPlayback = true;
+    pausedByUs = true;
+    v?.pause();
+  };
+
+  const setCover = (el, mode, postText = "", showId = null) => {
+    if (window.getComputedStyle(el).position === "static") el.style.position = "relative";
+    el.querySelector(".unspoiled-flag-btn")?.remove();
+    let overlay = el.querySelector(".unspoiled-overlay");
+    if (overlay && !overlay._unspoiledShorts) { overlay.remove(); overlay = null; }
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay._unspoiledShorts = true;
+      overlay.className = "unspoiled-overlay unspoiled-yt-overlay";
+      overlay.innerHTML = `
+        <div class="unspoiled-overlay-inner">
+          <div class="unspoiled-dots"><span class="ud ud1"></span><span class="ud ud2"></span><span class="ud ud3"></span></div>
+          <div class="unspoiled-wordmark">Unspoiled</div>
+          <button class="unspoiled-reveal-btn unspoiled-reveal-solid" type="button">Click to reveal</button>
+        </div>
+      `;
+      overlay.querySelector(".unspoiled-reveal-btn").addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const text = overlay._postText || "";
+        overlay.remove();
+        el.style.visibility = "";
+        el.dataset.unspoiled = "revealed";
+        verdict = "revealed";
+        holdPlayback = false;
+        pausedByUs = false;
+        el.querySelector("video")?.play().catch(() => {});
+        showFeedbackBar(el, null, text);
+      });
+      el.appendChild(overlay);
+    }
+    el.style.visibility = "hidden"; // hides the player; the overlay opts back into visible
+    overlay.classList.toggle("unspoiled-shorts-checking", mode === "checking");
+    overlay._postText = postText;
+    if (showId) overlay.dataset.unspoiledShow = showId;
+    else delete overlay.dataset.unspoiledShow;
+    el.dataset.unspoiled = mode === "spoiler" ? "blurred" : "checking";
+  };
+
+  const uncover = (el) => {
+    el.querySelector(".unspoiled-overlay")?.remove();
+    el.style.visibility = "";
+    delete el.dataset.unspoiled;
+    delete el.dataset.unspoiledPreblur;
+    holdPlayback = false;
+    const v = video();
+    if (mutedByUs && v) v.muted = false;
+    mutedByUs = false;
+    if (pausedByUs) v?.play().catch(() => {});
+    pausedByUs = false;
+  };
+
+  const clear = (el, title) => {
+    verdict = "clear";
+    uncover(el);
+    addFlagButton(el, el, title);
+  };
+
+  // Cover the player right now — no spoiler frame can be painted after this
+  const coverNow = () => {
+    const el = renderer();
+    if (!el || blocklist.length === 0) return;
+    holdPlayback = false; // a held (paused) spoiler must not block the next Short's autoplay
+    setCover(el, "checking");
+    const v = video();
+    if (v && !v.muted) { v.muted = true; mutedByUs = true; } // no audio while checking
+  };
+
+  // A swap signal turned out to be the same video — put back the verdict it already had
+  const restoreVerdict = () => {
+    const el = renderer();
+    if (!el) return;
+    if (verdict === "spoiler") {
+      setCover(el, "spoiler", evaluatedTitle, evaluatedShowId);
+      pausePlayback();
+    } else if (verdict === "clear" || verdict === "revealed") {
+      uncover(el);
+      if (verdict === "revealed") el.dataset.unspoiled = "revealed";
+    }
+    // "checking": that check is still running and will set the final state
+  };
+
+  const evaluate = async (id, prevCaption, myRun, attempt = 0) => {
+    if (myRun !== runId || playerId() !== id) return;
+    const el = renderer();
+    if (!el) return;
+    const title = titleFor(id, prevCaption);
+    if (!title) {
+      if (attempt < 30) {
+        setTimeout(() => evaluate(id, prevCaption, myRun, attempt + 1), 100);
+        return;
+      }
+      console.log("[Unspoiled] Shorts title not found for", id, "— uncovering");
+      evaluatedTitle = "";
+      clear(el, "");
+      return;
+    }
+    evaluatedTitle = title;
+    console.log("[Unspoiled] Shorts player title extracted:", id, title.slice(0, 80));
+    total++;
+    if (!passesKeywordFilter(title)) {
+      clear(el, title);
+      return;
+    }
+    passed++;
+    console.log("[Unspoiled] scanned:", total, "keyword-passed:", passed);
+    // Keyword hit: keep the cover and fully stop playback while Gemini decides
+    pausePlayback();
+    const spoiler = await classifyShort(title);
+    if (myRun !== runId || playerId() !== id) return; // the player has moved to another Short
+    if (spoiler) {
+      verdict = "spoiler";
+      evaluatedShowId = findMatchingShowId(title);
+      setCover(el, "spoiler", title, evaluatedShowId);
+      pausePlayback();
+      console.log("[Unspoiled] blurring post:", title.slice(0, 50));
+      chrome.storage.local.get(["spoilerCount"], (data) => {
+        chrome.storage.local.set({ spoilerCount: (data.spoilerCount || 0) + 1 });
+      });
+    } else {
+      clear(el, title);
+    }
+  };
+
+  const start = (id, isNewShort) => {
+    runId++;
+    // The caption still shows the previous Short's title at this point (it updates later)
+    const prevCaption = isNewShort ? captionText() : null;
+    evaluatedId = id;
+    evaluatedTitle = "";
+    evaluatedShowId = null;
+    verdict = "checking";
+    keywordSig = keywords.join("|");
+    coverNow();
+    evaluate(id, prevCaption, runId);
+  };
+
+  // Something suggests the player is switching videos: cover now, then wait (up to 1.5s)
+  // for the player's video ID to change. If it doesn't, it was a false alarm — restore.
+  const pollSwap = () => {
+    swapTimer = null;
+    const id = playerId();
+    if (id && id !== evaluatedId) {
+      start(id, evaluatedId !== null);
+      return;
+    }
+    if (performance.now() < swapDeadline) {
+      swapTimer = setTimeout(pollSwap, 40);
+      return;
+    }
+    restoreVerdict();
+  };
+  const beginSwap = () => {
+    if (!onShortsPage()) return;
+    coverNow();
+    swapDeadline = performance.now() + 1500;
+    if (!swapTimer) pollSwap();
+  };
+
+  // Earliest signal: the player's <video> starts loading a new source
+  const onMediaSwap = (e) => {
+    if (e.target.closest?.("ytd-reel-video-renderer")) beginSwap();
+  };
+  document.addEventListener("emptied", onMediaSwap, true);
+  document.addEventListener("loadstart", onMediaSwap, true);
+
+  // Backup signal: the player's title link points at a different video
+  const ensureObserver = () => {
+    const el = renderer();
+    if (!el || el === observedRenderer) return;
+    observedRenderer = el;
+    new MutationObserver(() => {
+      if (onShortsPage() && playerId() !== evaluatedId) beginSwap();
+    }).observe(el, { subtree: true, attributes: true, attributeFilter: ["href"] });
+  };
+
+  shortsController = {
+    // Called on swipes and whenever the page is rescanned (e.g. a show was added or removed)
+    check() {
+      if (!onShortsPage()) return;
+      ensureObserver();
+      const id = playerId();
+      if (!id) return;
+      if (id !== evaluatedId) start(id, evaluatedId !== null);
+      else if (keywords.join("|") !== keywordSig) start(id, false);
+    },
+  };
+
+  // Backup signal: the URL moves to a different Short
+  navigation.addEventListener("navigate", (e) => {
+    let dest;
+    try { dest = new URL(e.destination.url).pathname; } catch { return; }
+    const id = idFromHref(dest);
+    if (!id || id === evaluatedId) return;
+    beginSwap();
+    setTimeout(() => shortsController.check(), 50);
+  });
+  navigation.addEventListener("navigatesuccess", () => shortsController.check());
+
+  shortsController.check();
 }
 
 let tiktokIntersectionObserver = null;
@@ -449,6 +712,13 @@ function enqueue(el, selectors) {
   // both match the post selector and would each get an overlay. Skip the wrapper when it
   // contains a real card so only the inner card is blurred — avoids stacked double overlays.
   const tag = el.tagName?.toLowerCase();
+
+  // The fullscreen Shorts player is handled entirely by observeYouTubeShorts
+  if (tag === "ytd-reel-video-renderer") {
+    shortsController?.check();
+    return;
+  }
+
   if (
     location.hostname.includes("youtube.com") &&
     (tag === "ytd-rich-item-renderer" || tag === "ytd-grid-video-renderer") &&
@@ -843,6 +1113,9 @@ function injectStyles() {
       visibility: visible; /* opt out of the blurred element's visibility: hidden */
       cursor: default;
       background: rgb(20, 17, 14); /* fully opaque — video/thumbnail cannot bleed through */
+    }
+    .unspoiled-shorts-checking .unspoiled-reveal-btn {
+      visibility: hidden; /* Shorts cover while the title is checked — button appears only for spoilers */
     }
     .unspoiled-reveal-btn {
       pointer-events: auto;
