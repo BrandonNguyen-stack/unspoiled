@@ -1,4 +1,8 @@
-console.log("[Unspoiled] content script loaded");
+// Flip to true to trace scanning and classification in the page console.
+const DEBUG = false;
+const debug = (...args) => { if (DEBUG) console.log(...args); };
+
+debug("[Unspoiled] content script loaded");
 
 const API_URL = "https://unspoiled-api-sable.vercel.app/api/classify";
 
@@ -93,7 +97,7 @@ function extractPostText(el, selectors) {
   if (location.hostname.includes("tiktok.com") && isTiktokProfile()) {
     const imgEl = el.querySelector('img[alt]');
     const caption = imgEl?.alt?.trim() || "";
-    console.log("[Unspoiled] TikTok profile grid caption extracted:", caption.slice(0, 80));
+    debug("[Unspoiled] TikTok profile grid caption extracted:", caption.slice(0, 80));
     if (!caption) {
       setTimeout(() => {
         if (!el.dataset.unspoiled && !el.dataset.unspoiledPreblur) {
@@ -109,7 +113,7 @@ function extractPostText(el, selectors) {
       isTiktokSearch() ? '[data-e2e="search-card-desc"]' : '[data-e2e="video-desc"]'
     );
     const caption = descEl?.textContent?.trim() || "";
-    console.log("[Unspoiled] TikTok caption extracted:", caption.slice(0, 80));
+    debug("[Unspoiled] TikTok caption extracted:", caption.slice(0, 80));
     if (!caption) {
       setTimeout(() => {
         if (!el.dataset.unspoiled && !el.dataset.unspoiledPreblur) {
@@ -125,7 +129,7 @@ function extractPostText(el, selectors) {
       el.querySelector("ytd-reel-player-overlay-renderer #title") ||
       el.querySelector("#title") || el.querySelector("h2");
     const title = titleEl?.textContent?.trim() || "";
-    console.log("[Unspoiled] Shorts player title extracted:", title.slice(0, 80));
+    debug("[Unspoiled] Shorts player title extracted:", title.slice(0, 80));
     if (!title) {
       setTimeout(() => {
         if (!el.dataset.unspoiled && !el.dataset.unspoiledPreblur) {
@@ -139,7 +143,7 @@ function extractPostText(el, selectors) {
   if (el.tagName?.toLowerCase() === "ytm-shorts-lockup-view-model" || el.tagName?.toLowerCase() === "ytm-shorts-lockup-view-model-v2") {
     const titleEl = el.querySelector("h3 a span[role='text']") || el.querySelector("h3 a") || el.querySelector("h3");
     const title = titleEl?.textContent?.trim() || "";
-    console.log("[Unspoiled] Shorts title extracted:", title.slice(0, 80));
+    debug("[Unspoiled] Shorts title extracted:", title.slice(0, 80));
     if (!title) {
       setTimeout(() => {
         if (!el.dataset.unspoiled && !el.dataset.unspoiledPreblur) {
@@ -158,7 +162,7 @@ function extractPostText(el, selectors) {
       el.querySelector("h3") ||
       el.querySelector("[title]");
     const title = titleEl?.textContent?.trim() || titleEl?.getAttribute("title") || "";
-    console.log("[Unspoiled] yt-lockup title extracted:", title.slice(0, 80));
+    debug("[Unspoiled] yt-lockup title extracted:", title.slice(0, 80));
     return { text: title || "video", source: "yt-lockup" };
   }
 
@@ -209,7 +213,7 @@ function passesKeywordFilter(text) {
 async function init() {
   const data = await chrome.storage.local.get(["blocklist"]);
   blocklist = data.blocklist || [];
-  console.log("[Unspoiled] blocklist:", blocklist);
+  debug("[Unspoiled] blocklist:", blocklist);
 
   currentSelectors = getSelectors();
 
@@ -295,7 +299,7 @@ function scanAllVisiblePosts() {
     }
   }
   const count = document.querySelectorAll(currentSelectors.post).length;
-  console.log(`[Unspoiled] rescanning ${count} visible posts after blocklist change`);
+  debug(`[Unspoiled] rescanning ${count} visible posts after blocklist change`);
   scanPage(currentSelectors);
 }
 
@@ -314,7 +318,7 @@ function scanPage(selectors) {
   // Explicit pass for YouTube sidebar lockup cards — confirms they're actually present/found
   if (location.hostname.includes("youtube.com")) {
     const lockups = document.querySelectorAll("yt-lockup-view-model");
-    console.log("[Unspoiled] found yt-lockup-view-model:", lockups.length);
+    debug("[Unspoiled] found yt-lockup-view-model:", lockups.length);
     lockups.forEach((el) => enqueue(el, selectors));
   }
 }
@@ -421,7 +425,7 @@ async function classifyShort(text) {
       return false;
     }
     const data = await res.json();
-    console.log("[Unspoiled] classify response:", data);
+    debug("[Unspoiled] classify response:", data);
     return data.results?.find((r) => String(r.id) === "short")?.spoiler === true;
   } catch (err) {
     console.error("[Unspoiled] classify error:", err);
@@ -571,20 +575,20 @@ function observeYouTubeShorts(selectors) {
         setTimeout(() => evaluate(id, prevCaption, myRun, attempt + 1), 100);
         return;
       }
-      console.log("[Unspoiled] Shorts title not found for", id, "— uncovering");
+      debug("[Unspoiled] Shorts title not found for", id, "— uncovering");
       evaluatedTitle = "";
       clear(el, "");
       return;
     }
     evaluatedTitle = title;
-    console.log("[Unspoiled] Shorts player title extracted:", id, title.slice(0, 80));
+    debug("[Unspoiled] Shorts player title extracted:", id, title.slice(0, 80));
     total++;
     if (!passesKeywordFilter(title)) {
       clear(el, title);
       return;
     }
     passed++;
-    console.log("[Unspoiled] scanned:", total, "keyword-passed:", passed);
+    debug("[Unspoiled] scanned:", total, "keyword-passed:", passed);
     // Keyword hit: keep the cover and fully stop playback while Gemini decides
     pausePlayback();
     const spoiler = await classifyShort(title);
@@ -594,7 +598,7 @@ function observeYouTubeShorts(selectors) {
       evaluatedShowId = findMatchingShowId(title);
       setCover(el, "spoiler", title, evaluatedShowId);
       pausePlayback();
-      console.log("[Unspoiled] blurring post:", title.slice(0, 50));
+      debug("[Unspoiled] blurring post:", title.slice(0, 50));
       chrome.storage.local.get(["spoilerCount"], (data) => {
         chrome.storage.local.set({ spoilerCount: (data.spoilerCount || 0) + 1 });
       });
@@ -757,19 +761,19 @@ function enqueue(el, selectors) {
   }
 
   const { text, source } = extractPostText(el, selectors);
-  console.log(`[Unspoiled] post text extracted: ${text.length} chars from: ${source}`);
+  debug(`[Unspoiled] post text extracted: ${text.length} chars from: ${source}`);
   processedIds.add(key);
   processedTexts.set(key, text);
   total++;
   addFlagButton(el, key, text);
   if (!passesKeywordFilter(text)) {
     if (location.hostname.includes("youtube.com")) {
-      console.log("[Unspoiled] keyword MISS:", text.slice(0, 80), "| keywords:", keywords.slice(0, 5));
+      debug("[Unspoiled] keyword MISS:", text.slice(0, 80), "| keywords:", keywords.slice(0, 5));
     }
     return;
   }
   passed++;
-  console.log("[Unspoiled] scanned:", total, "keyword-passed:", passed);
+  debug("[Unspoiled] scanned:", total, "keyword-passed:", passed);
   preBlur(el);
   classifyBatch([{ el, text, key }]);
 }
@@ -794,7 +798,7 @@ async function classifyBatch(batch) {
     }
 
     const data = await res.json();
-    console.log("[Unspoiled] classify response:", data);
+    debug("[Unspoiled] classify response:", data);
     const resultMap = new Map(data.results.map((r) => [String(r.id), r.spoiler]));
 
     batch.forEach(({ el, text, key }, i) => {
@@ -805,7 +809,7 @@ async function classifyBatch(batch) {
         spoilerShowIds.set(key, showId);
         if (typeof key === "string") el.dataset.statusId = key;
         blurPost(el, text, showId);
-        console.log("[Unspoiled] blurring post:", text.slice(0, 50));
+        debug("[Unspoiled] blurring post:", text.slice(0, 50));
         chrome.storage.local.get(["spoilerCount"], (data) => {
           chrome.storage.local.set({ spoilerCount: (data.spoilerCount || 0) + 1 });
         });

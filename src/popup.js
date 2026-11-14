@@ -8,6 +8,14 @@ const autocompleteResults = document.getElementById("autocomplete-results");
 const blocklistEl = document.getElementById("blocklist");
 const emptyState = document.getElementById("empty-state");
 
+// TMDB titles are third-party text, so escape them before building markup.
+function escapeHtml(value) {
+  return String(value).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+
 let debounceTimer;
 let blocklist = [];
 let TMDB_TOKEN = "";
@@ -55,7 +63,6 @@ async function searchTMDB(query) {
       }
     );
     const data = await res.json();
-    console.log("TMDB response:", JSON.stringify(data));
     const results = data.results
       .filter((r) => r.media_type === "tv" || r.media_type === "movie")
       .slice(0, 5);
@@ -82,9 +89,9 @@ function renderAutocomplete(results) {
     const div = document.createElement("div");
     div.className = "autocomplete-item";
     div.innerHTML = `
-      ${poster ? `<img src="${poster}" alt="${title}" />` : `<div style="width:32px;height:48px;background:#2a2a2a;border-radius:4px;"></div>`}
+      ${poster ? `<img src="${poster}" alt="${escapeHtml(title)}" />` : `<div style="width:32px;height:48px;background:#2a2a2a;border-radius:4px;"></div>`}
       <div class="show-info">
-        <div class="show-title">${title}</div>
+        <div class="show-title">${escapeHtml(title)}</div>
         <div class="show-meta">${type}${year ? " · " + year : ""}</div>
       </div>
     `;
@@ -138,8 +145,8 @@ function renderBlocklist() {
     const li = document.createElement("li");
     li.innerHTML = `
       <span>
-        <span class="show-name">${item.title}</span>
-        ${item.year ? `<span class="show-year">${item.year}</span>` : ""}
+        <span class="show-name">${escapeHtml(item.title)}</span>
+        ${item.year ? `<span class="show-year">${escapeHtml(item.year)}</span>` : ""}
       </span>
       <button data-id="${item.id}" title="Remove">×</button>
     `;

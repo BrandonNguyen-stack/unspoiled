@@ -1,0 +1,14 @@
+{
+  "name": "unspoiled",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension that blocks TV and movie spoilers on social media.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "HEADED=1 playwright test",
+    "test:setup": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0"
+  }
+}
